@@ -52,21 +52,31 @@ def extra_tickers():
     return out
 
 
-def fetch_closes(symbols):
+def fetch_closes(symbols, tz):
+    """Download daily closes for one market and index them by that exchange's local date.
+
+    Korean and US tickers are fetched separately: mixing them in one download makes
+    yfinance align both on a shared timezone, which shifts Korean bars by a day.
+    """
     frames = {}
     for i in range(0, len(symbols), CHUNK):
         chunk = symbols[i:i + CHUNK]
         df = yf.download(chunk, period="2mo", interval="1d", auto_adjust=True,
-                         group_by="ticker", threads=True, progress=False)
+                         group_by="ticker", threads=True, progress=False, ignore_tz=False)
         for sym in chunk:
             try:
                 s = df[sym]["Close"] if len(chunk) > 1 else df["Close"]
             except KeyError:
                 continue
             s = s.dropna()
-            if len(s) >= 2:
-                frames[sym] = s
-        print(f"fetched {min(i + CHUNK, len(symbols))}/{len(symbols)}", file=sys.stderr)
+            if len(s) < 2:
+                continue
+            idx = pd.DatetimeIndex(s.index)
+            if idx.tz is not None:
+                idx = idx.tz_convert(tz).tz_localize(None)
+            s.index = idx.normalize()
+            frames[sym] = s[~s.index.duplicated(keep="last")]
+        print(f"{tz}: fetched {min(i + CHUNK, len(symbols))}/{len(symbols)}", file=sys.stderr)
     return frames
 
 
@@ -85,12 +95,10 @@ def main():
             print(f"listing failed: {source.__name__}: {e}", file=sys.stderr)
     names.update(extra_tickers())
 
-    frames = fetch_closes(sorted(names))
+    kr = sorted(s for s in names if s.endswith((".KS", ".KQ")))
+    us = sorted(s for s in names if not s.endswith((".KS", ".KQ")))
     markets = {"KR": "KR", "US": "US"}
-    by_market = {"KR": {}, "US": {}}
-    for sym, s in frames.items():
-        m = "KR" if sym.endswith((".KS", ".KQ")) else "US"
-        by_market[m][sym] = s
+    by_market = {"KR": fetch_closes(kr, "Asia/Seoul"), "US": fetch_closes(us, "America/New_York")}
 
     out = {"asOf": None, "markets": {}, "symbols": {}}
     for m, series in by_market.items():
