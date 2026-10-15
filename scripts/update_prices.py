@@ -6,7 +6,8 @@ FinanceDataReader and prices from Yahoo Finance via yfinance.
 import json
 import math
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import FinanceDataReader as fdr
@@ -17,6 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "data" / "prices.json"
 EXTRA = ROOT / "config" / "extra_tickers.txt"
 KEEP_DAYS = 30
+KRX_SNAPSHOT = {}  # "005930.KS" -> latest close from the KRX listing, filled by korean_universe()
 CHUNK = 200
 
 
@@ -31,7 +33,14 @@ def korean_universe():
             suffix = ".KQ"
         else:
             continue
-        out[str(r["Code"]).zfill(6) + suffix] = str(r["Name"])
+        sym = str(r["Code"]).zfill(6) + suffix
+        out[sym] = str(r["Name"])
+        try:
+            close = float(r.get("Close"))
+            if close > 0:
+                KRX_SNAPSHOT[sym] = close
+        except (TypeError, ValueError):
+            pass
     return out
 
 
@@ -80,6 +89,29 @@ def fetch_closes(symbols, tz):
     return frames
 
 
+def add_krx_session(series):
+    """Yahoo often publishes the Korean daily bar late. The KRX listing carries every
+    stock's latest close, so when Yahoo's last Korean day is behind, append that
+    snapshot as the latest session (only if it clearly is a newer session)."""
+    if not series or not KRX_SNAPSHOT:
+        return
+    now = datetime.now(ZoneInfo("Asia/Seoul"))
+    session = now.date() if (now.hour, now.minute) >= (15, 40) else now.date() - timedelta(days=1)
+    while session.weekday() >= 5:
+        session -= timedelta(days=1)
+    session = pd.Timestamp(session)
+    last_day = max(s.index[-1] for s in series.values())
+    if last_day >= session:
+        return
+    common = [sym for sym in series if sym in KRX_SNAPSHOT and series[sym].index[-1] == last_day]
+    changed = sum(1 for sym in common if abs(KRX_SNAPSHOT[sym] / float(series[sym].iloc[-1]) - 1) > 1e-9)
+    if not common or changed < 0.5 * len(common):  # snapshot is the same session Yahoo already has (e.g. a holiday)
+        return
+    for sym in common:
+        series[sym] = pd.concat([series[sym], pd.Series([KRX_SNAPSHOT[sym]], index=[session])])
+    print(f"KR: added {session.date()} from KRX listing for {len(common)} symbols", file=sys.stderr)
+
+
 def round_sig(v, digits=6):
     if v is None or not math.isfinite(v) or v == 0:
         return None if v is None or not math.isfinite(v) else 0
@@ -99,6 +131,7 @@ def main():
     us = sorted(s for s in names if not s.endswith((".KS", ".KQ")))
     markets = {"KR": "KR", "US": "US"}
     by_market = {"KR": fetch_closes(kr, "Asia/Seoul"), "US": fetch_closes(us, "America/New_York")}
+    add_krx_session(by_market["KR"])
 
     out = {"asOf": None, "markets": {}, "symbols": {}}
     for m, series in by_market.items():
